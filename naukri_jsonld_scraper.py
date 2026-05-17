@@ -11,6 +11,10 @@ from datetime import datetime
 import re
 from urllib.parse import urljoin
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -45,26 +49,18 @@ class NaukriJSONLDScraper:
         try:
             # Handle different URL formats
             if href.startswith('http'):
-                # Already a full URL
                 normalized_url = href
             elif href.startswith('//'):
-                # Protocol-relative URL
                 normalized_url = 'https:' + href
             elif href.startswith('/'):
-                # Relative URL from root
                 normalized_url = urljoin(self.base_url, href)
             else:
-                # Try to construct full URL
                 normalized_url = urljoin(self.base_url + '/', href)
 
-            # Additional validation - ensure it's a valid Naukri job URL
             if normalized_url and 'naukri.com' in normalized_url:
-                # Clean up any double slashes (except after protocol)
-                import re
                 normalized_url = re.sub(r'(?<!:)//+', '/', normalized_url)
                 return normalized_url
             else:
-                # If not a valid Naukri URL, try to construct one from title
                 if title:
                     title_slug = title.lower().replace(' ', '-').replace('/', '-').replace('(', '').replace(')', '')
                     return f"{self.base_url}/job-listings-{title_slug}"
@@ -72,6 +68,109 @@ class NaukriJSONLDScraper:
         except Exception as e:
             logger.debug(f"Error normalizing URL '{href}': {e}")
             return None
+
+    def _create_selenium_driver(self):
+        """Create a Selenium WebDriver for detail page scraping."""
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+
+        return webdriver.Chrome(options=options)
+
+    def _clean_html_text(self, html_text):
+        if not html_text:
+            return None
+
+        from bs4 import BeautifulSoup
+        return BeautifulSoup(html_text, 'html.parser').get_text(separator=' ', strip=True)
+
+    def _extract_job_from_detail_page(self, driver, url):
+        """Fetch the job detail page in Selenium and extract structured fields."""
+        result = {}
+        try:
+            driver.get(url)
+            driver.implicitly_wait(8)
+
+            page_source = driver.page_source
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(page_source, 'html.parser')
+            jsonld_scripts = soup.find_all('script', {'type': 'application/ld+json'})
+
+            for script in jsonld_scripts:
+                try:
+                    jsonld_data = json.loads(script.string.strip())
+                except Exception:
+                    continue
+
+                if isinstance(jsonld_data, dict) and jsonld_data.get('@type') == 'JobPosting':
+                    result['company'] = None
+                    hiring_org = jsonld_data.get('hiringOrganization') or {}
+                    if isinstance(hiring_org, dict):
+                        result['company'] = hiring_org.get('name') or hiring_org.get('identifier')
+
+                    result['job_description'] = self._clean_html_text(jsonld_data.get('description'))
+                    result['posted_date'] = jsonld_data.get('datePosted')
+                    result['salary'] = None
+                    base_salary = jsonld_data.get('baseSalary')
+                    if isinstance(base_salary, dict):
+                        salary_value = base_salary.get('value') or {}
+                        if isinstance(salary_value, dict):
+                            min_sal = salary_value.get('minValue')
+                            max_sal = salary_value.get('maxValue')
+                            currency = salary_value.get('currency')
+                            if min_sal or max_sal:
+                                salary_parts = []
+                                if min_sal:
+                                    salary_parts.append(str(min_sal))
+                                if max_sal:
+                                    salary_parts.append(str(max_sal))
+                                salary_text = ' - '.join(salary_parts)
+                                if currency:
+                                    salary_text = f"{salary_text} {currency}"
+                                result['salary'] = salary_text
+                        elif isinstance(salary_value, str):
+                            result['salary'] = salary_value
+                    elif isinstance(base_salary, str):
+                        result['salary'] = base_salary
+
+                    result['skills'] = None
+                    if 'skills' in jsonld_data:
+                        if isinstance(jsonld_data['skills'], list):
+                            result['skills'] = ', '.join(jsonld_data['skills'])
+                        else:
+                            result['skills'] = jsonld_data['skills']
+
+                    result['experience'] = jsonld_data.get('experienceRequirements')
+                    return result
+
+        except Exception as e:
+            logger.warning(f"Could not extract detail fields from {url}: {e}")
+
+        return result
+
+    def _populate_detail_fields(self, jobs):
+        if not jobs:
+            return jobs
+
+        driver = None
+        try:
+            driver = self._create_selenium_driver()
+            for job in jobs:
+                if job.get('job_url'):
+                    details = self._extract_job_from_detail_page(driver, job['job_url'])
+                    if details:
+                        for key, value in details.items():
+                            if value and not job.get(key):
+                                job[key] = value
+        except Exception as e:
+            logger.warning(f"Selenium detail scraping failed: {e}")
+        finally:
+            if driver:
+                driver.quit()
+
+        return jobs
 
     def _extract_job_from_jsonld(self, jsonld_data):
         """
@@ -170,32 +269,33 @@ class NaukriJSONLDScraper:
                 logger.info(f"\nSearching for '{role}' in '{location}'...")
 
                 jobs = self._scrape_search_page(role, location)
-
-                # Filter for FAANG companies if possible
-                filtered_jobs = []
                 for job in jobs:
                     job['role'] = role
                     job['location'] = location
+                all_jobs.extend(jobs)
+                logger.info(f"Found {len(jobs)} jobs for {role} in {location}")
 
-                    # Basic company filtering (if company name is in title/URL)
-                    company_match = False
-                    job_text = f"{job.get('title', '')} {job.get('job_url', '')}".lower()
+        # Populate additional fields from the detail pages when available
+        all_jobs = self._populate_detail_fields(all_jobs)
 
-                    for company in self.companies:
-                        if company.lower() in job_text:
-                            company_match = True
-                            job['company'] = company
-                            break
+        # Filter for FAANG companies if possible
+        filtered_jobs = []
+        for job in all_jobs:
+            company_match = False
+            job_text = f"{job.get('title', '')} {job.get('job_url', '')} {job.get('company', '')}".lower()
 
-                    # Include job if it's from a FAANG company or if we can't determine (to be safe)
-                    if company_match or not job.get('company'):
-                        filtered_jobs.append(job)
+            for company in self.companies:
+                if company.lower() in job_text:
+                    company_match = True
+                    if not job.get('company'):
+                        job['company'] = company
+                    break
 
-                all_jobs.extend(filtered_jobs)
-                logger.info(f"Found {len(filtered_jobs)} relevant jobs for {role} in {location}")
+            if company_match or not job.get('company'):
+                filtered_jobs.append(job)
 
-        self.job_data = all_jobs
-        return all_jobs
+        self.job_data = filtered_jobs
+        return filtered_jobs
 
     def save_to_json(self, filename=None):
         """
